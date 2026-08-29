@@ -6,6 +6,7 @@ load_dotenv()
 import subprocess
 import tempfile
 import httpx
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -131,15 +132,95 @@ async def create_short(req) -> dict:
         }
 
 
+def probe_video_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    duration_raw = result.stdout.strip()
+    if not duration_raw:
+        raise RuntimeError(f"unable to read video duration from {path}")
+    return float(duration_raw)
+
+
+def _normalize_clip_bounds(
+    start: float,
+    end: float,
+    source_duration: float,
+) -> tuple[float, float]:
+    if end <= start:
+        raise RuntimeError(
+            f"clip end must be after clip start: start={start:.3f}s end={end:.3f}s"
+        )
+
+    if source_duration <= 0:
+        raise RuntimeError(f"source video has invalid duration: {source_duration:.3f}s")
+
+    requested_start = max(0.0, start)
+    requested_end = min(end, source_duration)
+
+    if requested_start >= source_duration:
+        print(
+            "[renderer] clip range is outside source duration; "
+            f"falling back to full source start={start:.3f}s end={end:.3f}s "
+            f"duration={source_duration:.3f}s"
+        )
+        return 0.0, source_duration
+
+    if requested_end <= requested_start:
+        print(
+            "[renderer] clip end is outside source duration; "
+            f"using remaining source from {requested_start:.3f}s to "
+            f"{source_duration:.3f}s"
+        )
+        requested_end = source_duration
+
+    return requested_start, requested_end
+
+
 def extract_clip(input_path: Path, output_path: Path, start: float, end: float):
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-to", str(end),
-        "-i", str(input_path),
-        "-c", "copy",
-        str(output_path)
-    ], check=True, capture_output=True)
+    source_duration = probe_video_duration(input_path)
+    clip_start, clip_end = _normalize_clip_bounds(start, end, source_duration)
+    clip_duration = clip_end - clip_start
+
+    print(
+        "[renderer] extracting clip "
+        f"start={clip_start:.3f}s end={clip_end:.3f}s "
+        f"duration={clip_duration:.3f}s"
+    )
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(clip_start),
+            "-i",
+            str(input_path),
+            "-t",
+            str(clip_duration),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
 
 
 def extract_thumbnail(video_path: Path, thumb_path: Path):
@@ -161,7 +242,6 @@ def get_video_duration(path: Path) -> float:
         "-show_format",
         str(path)
     ], capture_output=True, text=True)
-    import json
     data = json.loads(result.stdout)
     return float(data["format"]["duration"])
 
