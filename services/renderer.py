@@ -123,12 +123,18 @@ async def create_short(req) -> dict:
         return {
             "job_id": req.job_id,
             "clip_id": req.clip_id,
+            "jobId": req.job_id,
+            "clipId": req.clip_id,
             "output_url": video_url,
+            "outputUrl": video_url,
             "thumbnail_url": thumb_url,
+            "thumbnailUrl": thumb_url,
             "duration": duration,
             "resolution": "1080x1920",
             "file_size_bytes": file_size,
+            "fileSizeBytes": file_size,
             "style_applied": req.style,
+            "styleApplied": req.style,
         }
 
 

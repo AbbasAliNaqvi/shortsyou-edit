@@ -162,6 +162,8 @@ async def process_in_background(req: CreateShortRequest):
         error_payload = {
             "job_id": req.job_id,
             "clip_id": req.clip_id,
+            "jobId": req.job_id,
+            "clipId": req.clip_id,
             "error": str(exc),
         }
 
@@ -195,6 +197,7 @@ async def send_callback(
             callback_url,
             json=payload,
             headers={
+                "X-Internal-API-Key": callback_key,
                 "X-Internal-Key": callback_key,
                 "Content-Type": "application/json",
             },
