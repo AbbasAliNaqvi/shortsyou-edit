@@ -3,6 +3,16 @@ from pathlib import Path
 import whisper
 
 
+def _ffmpeg_supports_filter(filter_name: str) -> bool:
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return f" {filter_name} " in result.stdout
+
+
 def _font_exists(name: str) -> bool:
     try:
         result = subprocess.run(
@@ -74,6 +84,26 @@ async def add_captions(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not _ffmpeg_supports_filter("drawtext"):
+        print(
+            "[captions] ffmpeg drawtext filter is unavailable; "
+            "skipping caption burn-in and copying input video"
+        )
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-c",
+                "copy",
+                str(output_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return
 
     # ---------------------------------------------------------
     # Select font
