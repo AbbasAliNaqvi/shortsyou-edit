@@ -50,7 +50,6 @@ STYLE_CONFIGS = {
     }
 }
 
-
 async def create_short(req) -> dict:
     config = STYLE_CONFIGS.get(req.style, STYLE_CONFIGS["clean"])
 
@@ -72,49 +71,127 @@ async def create_short(req) -> dict:
         else:
             clean_path = clip_path
 
-        # Step 4: Crop to 9:16 vertical format
-        vertical_path = tmp / "vertical.mp4"
-        crop_to_vertical(clean_path, vertical_path)
+        if req.layout == "two_frame":
+            print("[renderer] two-frame layout requested")
 
-        # Step 5: Apply background style
-        bg_path = tmp / "background.mp4"
-        apply_background(vertical_path, bg_path, config["background"])
+            from services.two_frame import create_two_frame_short
 
-        # Step 6: Apply color grade
-        graded_path = tmp / "graded.mp4"
-        apply_color_grade(bg_path, graded_path, config["color_grade"])
+            two_frame_path = tmp / "two_frame.mp4"
+            fallback_path = tmp / "vertical.mp4"
 
-        # Step 7: Generate and add captions
-        captioned_path = tmp / "captioned.mp4"
-        await add_captions(graded_path, captioned_path, config, req.hook_text)
+            success = create_two_frame_short(
+                clean_path,
+                two_frame_path,
+                fallback_path,
+            )
 
-        # Step 8: Select and mix background music
-        final_path = tmp / "final.mp4"
-        mood = req.music_mood or config["music_mood"]
-        if mood:
-            select_and_mix_music(captioned_path, final_path, mood)
+            if success:
+                # Two-frame layout worked
+                working_path = two_frame_path
+            else:
+                # Fall back to normal vertical crop
+                working_path = fallback_path
+
+            # Apply color grade
+            graded_path = tmp / "graded.mp4"
+            apply_color_grade(
+                working_path,
+                graded_path,
+                config["color_grade"],
+            )
+
+            # Generate and add captions
+            captioned_path = tmp / "captioned.mp4"
+            # await add_captions(
+            #     graded_path,
+            #     captioned_path,
+            #     config,
+            #     req.hook_text,
+            # )
+            add_captions(
+                graded_path,
+                captioned_path,
+                config,
+                req.hook_text,
+            )
+
+            # Select and mix background music
+            final_path = tmp / "final.mp4"
+            mood = req.music_mood or config["music_mood"]
+
+            if mood:
+                select_and_mix_music(
+                    captioned_path,
+                    final_path,
+                    mood,
+                )
+            else:
+                final_path = captioned_path
+
         else:
-            final_path = captioned_path
+            # Step 4: Crop to 9:16 vertical format
+            vertical_path = tmp / "vertical.mp4"
+            crop_to_vertical(clean_path, vertical_path)
 
-        # Step 9: Generate thumbnail (best frame)
+            # Step 5: Apply background style
+            bg_path = tmp / "background.mp4"
+            apply_background(
+                vertical_path,
+                bg_path,
+                config["background"],
+            )
+
+            # Step 6: Apply color grade
+            graded_path = tmp / "graded.mp4"
+            apply_color_grade(
+                bg_path,
+                graded_path,
+                config["color_grade"],
+            )
+
+            # Step 7: Generate and add captions
+            captioned_path = tmp / "captioned.mp4"
+            await add_captions(
+                graded_path,
+                captioned_path,
+                config,
+                req.hook_text,
+            )
+
+            # Step 8: Select and mix background music
+            final_path = tmp / "final.mp4"
+            mood = req.music_mood or config["music_mood"]
+
+            if mood:
+                select_and_mix_music(
+                    captioned_path,
+                    final_path,
+                    mood,
+                )
+            else:
+                final_path = captioned_path
+
+
+        # Generate thumbnail
         thumbnail_path = tmp / "thumbnail.jpg"
         extract_thumbnail(final_path, thumbnail_path)
 
-        # Step 10: Upload both to Supabase
+        # Upload both to Supabase
         video_key = f"processed-clips/{req.user_id}/{req.clip_id}.mp4"
         thumb_key = f"thumbnails/{req.user_id}/{req.clip_id}.jpg"
 
         video_url = await upload_to_supabase(
-        final_path,
-        "videos",
-        video_key,
-        "video/mp4",
+            final_path,
+            "videos",
+            video_key,
+            "video/mp4",
         )
+
         thumb_url = await upload_to_supabase(
-        thumbnail_path,
-        "videos",
-        thumb_key,
-        "image/jpeg",
+            thumbnail_path,
+            "videos",
+            thumb_key,
+            "image/jpeg",
         )
 
         file_size = os.path.getsize(final_path)
@@ -136,7 +213,6 @@ async def create_short(req) -> dict:
             "style_applied": req.style,
             "styleApplied": req.style,
         }
-
 
 def probe_video_duration(path: Path) -> float:
     result = subprocess.run(

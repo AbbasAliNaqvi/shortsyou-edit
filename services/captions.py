@@ -1,226 +1,182 @@
+import json
 import subprocess
+import tempfile
 from pathlib import Path
-import whisper
 
 
-def _ffmpeg_supports_filter(filter_name: str) -> bool:
+FONT_FALLBACK_ORDER = ["Impact", "Anton", "Arial-Bold", "DejaVu-Sans-Bold"]
+WORDS_PER_GROUP = 4
+
+
+def _detect_font() -> str:
     result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-filters"],
+        ["fc-list"],
         capture_output=True,
         text=True,
-        check=True,
     )
-    return f" {filter_name} " in result.stdout
+    installed = result.stdout.lower()
+    for font in FONT_FALLBACK_ORDER:
+        if font.lower().replace("-", " ") in installed:
+            return font
+    return "monospace"
 
 
-def _font_exists(name: str) -> bool:
+def _has_drawtext() -> bool:
+    result = subprocess.run(
+        ["ffmpeg", "-filters"],
+        capture_output=True,
+        text=True,
+    )
+    return "drawtext" in result.stdout
+
+
+def _transcribe_local(video_path: Path) -> list[dict]:
     try:
-        result = subprocess.run(
-            ["fc-list", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return bool(result.stdout.strip())
-    except FileNotFoundError:
-        return False
+        import whisper
+    except ImportError:
+        return []
 
-
-def _get_font_file() -> str:
-    """
-    Prefer system Impact.
-    Fall back to the project's local Anton font.
-    """
-    if _font_exists("Impact"):
-        return "Impact"
-
-    project_root = Path(__file__).resolve().parent.parent
-    anton_path = project_root / "fonts" / "Anton.woff2"
-
-    if anton_path.exists():
-        return str(anton_path)
-
-    return "Anton"
-
-
-def _escape_drawtext(text: str) -> str:
-    """Escape text for FFmpeg drawtext."""
-    return (
-        text.replace("\\", r"\\")
-        .replace(":", r"\:")
-        .replace("'", r"\'")
-        .replace("%", r"\%")
-        .replace("[", r"\[")
-        .replace("]", r"\]")
-    )
-
-
-async def add_captions(
-    input_path: Path,
-    output_path: Path,
-    config: dict,
-    hook_text: str = None,
-):
-    """
-    Transcribes video with Whisper (runs locally, free).
-    Adds word-by-word animated captions using FFmpeg drawtext.
-
-    Uses Impact when installed, otherwise falls back to
-    the project's local Anton.woff2 font.
-
-    If hook_text is provided, it appears at the top
-    for the first 3 seconds.
-    """
-
-    # ---------------------------------------------------------
-    # Validate input
-    # ---------------------------------------------------------
-    input_path = Path(input_path)
-    output_path = Path(output_path)
-
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Input video not found: {input_path}"
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not _ffmpeg_supports_filter("drawtext"):
-        print(
-            "[captions] ffmpeg drawtext filter is unavailable; "
-            "skipping caption burn-in and copying input video"
-        )
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(input_path),
-                "-c",
-                "copy",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return
-
-    # ---------------------------------------------------------
-    # Select font
-    # ---------------------------------------------------------
-    font_file = _get_font_file()
-
-    # ---------------------------------------------------------
-    # Transcribe video with Whisper
-    # ---------------------------------------------------------
     model = whisper.load_model("base")
-
     result = model.transcribe(
-        str(input_path),
+        str(video_path),
         word_timestamps=True,
         verbose=False,
     )
 
-    # ---------------------------------------------------------
-    # Build FFmpeg filters
-    # ---------------------------------------------------------
-    filters = []
-
-    # ---------------------------------------------------------
-    # Hook text
-    # ---------------------------------------------------------
-    if hook_text:
-        escaped = _escape_drawtext(hook_text)
-
-        filters.append(
-            "drawtext="
-            f"text='{escaped}':"
-            "fontsize=48:"
-            "fontcolor=yellow:"
-            "x=(w-text_w)/2:"
-            "y=80:"
-            "enable='between(t,0,3)':"
-            "box=1:"
-            "boxcolor=black@0.5:"
-            "boxborderw=8:"
-            f"fontfile='{font_file}'"
-        )
-
-    # ---------------------------------------------------------
-    # Word-by-word captions
-    # ---------------------------------------------------------
-    font_size = config.get("font_size", 52)
-    color = config.get("text_color", "white")
-    highlight = config.get("highlight_color", "#FFD700")
-
+    words = []
     for segment in result.get("segments", []):
         for word_data in segment.get("words", []):
             word = word_data.get("word", "").strip()
+            if word:
+                words.append({
+                    "word":  word,
+                    "start": word_data["start"],
+                    "end":   word_data["end"],
+                })
+    return words
 
-            if not word:
-                continue
 
-            start = word_data.get("start")
-            end = word_data.get("end")
+def _group_words(words: list[dict], group_size: int = WORDS_PER_GROUP) -> list[dict]:
+    """
+    Groups individual word timestamps into caption phrases.
+    Showing 3-4 words at a time is more readable than one word at a time.
+    """
+    groups = []
+    for i in range(0, len(words), group_size):
+        chunk = words[i : i + group_size]
+        if not chunk:
+            continue
+        groups.append({
+            "text":  " ".join(w["word"] for w in chunk),
+            "start": chunk[0]["start"],
+            "end":   chunk[-1]["end"],
+        })
+    return groups
 
-            if start is None or end is None:
-                continue
 
-            escaped = _escape_drawtext(word)
-
-            # -------------------------------------------------
-            # Normal caption
-            # -------------------------------------------------
-            filters.append(
-                "drawtext="
-                f"text='{escaped}':"
-                f"fontsize={font_size}:"
-                f"fontcolor={color}:"
-                "x=(w-text_w)/2:"
-                "y=h-200:"
-                f"enable='between(t,{start},{end})':"
-                "box=1:"
-                "boxcolor=black@0.4:"
-                "boxborderw=6:"
-                f"fontfile='{font_file}'"
-            )
-
-            # -------------------------------------------------
-            # Highlighted current word
-            # -------------------------------------------------
-            filters.append(
-                "drawtext="
-                f"text='{escaped}':"
-                f"fontsize={font_size + 4}:"
-                f"fontcolor={highlight}:"
-                "x=(w-text_w)/2:"
-                "y=h-200:"
-                f"enable='between(t,{start},{end})':"
-                f"fontfile='{font_file}'"
-            )
-
-    # ---------------------------------------------------------
-    # Apply FFmpeg
-    # ---------------------------------------------------------
-    filter_str = ",".join(filters) if filters else "null"
-
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-vf",
-            filter_str,
-            "-c:v",
-            "libx264",
-            "-crf",
-            "22",
-            "-preset",
-            "medium",
-            "-c:a",
-            "copy",
-            str(output_path),
-        ],
-        check=True,
+def _escape(text: str) -> str:
+    return (
+        text
+        .replace("\\", "\\\\")
+        .replace("'",  "\u2019")   # smart apostrophe — avoids shell quoting issues
+        .replace(":",  "\\:")
+        .replace("%",  "\\%")
+        .replace("[",  "\\[")
+        .replace("]",  "\\]")
     )
+
+
+def add_captions(
+    input_path: Path,
+    output_path: Path,
+    config: dict,
+    hook_text: str = None,
+) -> None:
+    """
+    Burns animated captions into the video using FFmpeg drawtext.
+    Shows WORDS_PER_GROUP words at a time — readable on mobile.
+    Falls back to silent copy if drawtext is unavailable.
+    """
+    if not _has_drawtext():
+        print("[captions] ffmpeg drawtext filter is unavailable; skipping caption burn-in and copying input video")
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+
+    font      = _detect_font()
+    font_size = config.get("font_size", 60)
+    color     = config.get("text_color", "white")
+    highlight = config.get("highlight_color", "#FFD700")
+
+    # Transcribe locally with Whisper
+    words  = _transcribe_local(input_path)
+    groups = _group_words(words, WORDS_PER_GROUP)
+
+    filters = []
+
+    # Hook text — top of screen, first 3 seconds, yellow
+    if hook_text:
+        escaped = _escape(hook_text)
+        filters.append(
+            f"drawtext="
+            f"text='{escaped}':"
+            f"fontfile=/System/Library/Fonts/Supplemental/Impact.ttf:"
+            f"fontsize={font_size - 6}:"
+            f"fontcolor={highlight}:"
+            f"x=(w-text_w)/2:"
+            f"y=120:"
+            f"enable='between(t,0,3)':"
+            f"box=1:"
+            f"boxcolor=black@0.55:"
+            f"boxborderw=10"
+        )
+
+    # Caption groups — bottom third, white with dark box
+    for group in groups:
+        escaped = _escape(group["text"])
+        start   = group["start"]
+        end     = group["end"]
+
+        filters.append(
+            f"drawtext="
+            f"text='{escaped}':"
+            f"fontsize={font_size}:"
+            f"fontcolor={color}:"
+            f"x=(w-text_w)/2:"
+            f"y=h-220:"
+            f"enable='between(t,{start:.3f},{end:.3f})':"
+            f"box=1:"
+            f"boxcolor=black@0.6:"
+            f"boxborderw=12"
+        )
+
+    # If no transcription, at least show the hook
+    if not filters:
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+
+    filter_str = ",".join(filters)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vf", filter_str,
+        "-c:v", "libx264",
+        "-crf", "22",
+        "-preset", "medium",
+        "-c:a", "copy",
+        str(output_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"[captions] ffmpeg caption burn failed:\n{result.stderr}")
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        import shutil
+        shutil.copy2(input_path, output_path)

@@ -74,6 +74,8 @@ class CreateShortRequest(BaseModel):
     callback_url: str
     callback_key: str
 
+    layout: str = "standard"
+
 
 class CreateShortResponse(BaseModel):
     job_id: str
