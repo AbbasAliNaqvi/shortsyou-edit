@@ -16,6 +16,8 @@ from .music import select_and_mix_music
 from .backgrounds import apply_background
 from .grader import apply_color_grade
 from .cleaner import remove_silences_and_fillers
+from services.sfx import add_sfx, auto_sfx_for_emotion
+
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
@@ -151,7 +153,7 @@ async def create_short(req) -> dict:
 
             # Step 7: Generate and add captions
             captioned_path = tmp / "captioned.mp4"
-            await add_captions(
+            add_captions(
                 graded_path,
                 captioned_path,
                 config,
@@ -170,6 +172,22 @@ async def create_short(req) -> dict:
                 )
             else:
                 final_path = captioned_path
+
+            # Step 9: Add sound effects after music, before thumbnail generation
+            sfx_path = tmp / "sfx.mp4"
+
+            # Use SFX from request if provided, otherwise auto-detect from emotion
+            sfx_events = (
+                [event.model_dump() for event in req.sfx_events]
+                if req.sfx_events
+                else auto_sfx_for_emotion(
+                    req.emotion_type or "excited",
+                    req.end_time - req.start_time,
+                )
+            )
+
+            add_sfx(final_path, sfx_path, sfx_events)
+            final_path = sfx_path
 
 
         # Generate thumbnail

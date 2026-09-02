@@ -48,6 +48,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class SFXEvent(BaseModel):
+    type:      str
+    at_second: float
 
 # ---------------------------------------------------------
 # Request / Response Models
@@ -75,6 +78,9 @@ class CreateShortRequest(BaseModel):
     callback_key: str
 
     layout: str = "standard"
+
+    emotion_type:    str   = "excited"
+    sfx_events:      list[SFXEvent] = []
 
 
 class CreateShortResponse(BaseModel):
