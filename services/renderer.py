@@ -1,3 +1,5 @@
+import asyncio
+import base64
 import os
 from dotenv import load_dotenv
 
@@ -9,6 +11,7 @@ import httpx
 import json
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from .cropper import crop_to_vertical
 from .captions import add_captions
@@ -54,6 +57,15 @@ STYLE_CONFIGS = {
 
 async def create_short(req) -> dict:
     config = STYLE_CONFIGS.get(req.style, STYLE_CONFIGS["clean"])
+    # Explicit editor controls win over the style preset. This keeps the API
+    # backwards compatible while allowing creators to mix a custom look.
+    config = {**config}
+    if getattr(req, "background_style", None):
+        config["background"] = req.background_style
+    if getattr(req, "color_grade", None):
+        config["color_grade"] = req.color_grade
+    if getattr(req, "caption_style", None):
+        apply_caption_style(config, req.caption_style)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
@@ -73,18 +85,19 @@ async def create_short(req) -> dict:
         else:
             clean_path = clip_path
 
-        if req.layout == "two_frame":
-            print("[renderer] two-frame layout requested")
+        if req.layout in {"two_frame", "multi_face", "auto_face"}:
+            print(f"[renderer] adaptive face layout requested: {req.layout}")
 
-            from services.two_frame import create_two_frame_short
+            from services.two_frame import create_adaptive_face_short
 
-            two_frame_path = tmp / "two_frame.mp4"
+            two_frame_path = tmp / "face_layout.mp4"
             fallback_path = tmp / "vertical.mp4"
 
-            success = create_two_frame_short(
+            success = create_adaptive_face_short(
                 clean_path,
                 two_frame_path,
                 fallback_path,
+                mode=req.layout,
             )
 
             if success:
@@ -121,7 +134,7 @@ async def create_short(req) -> dict:
             final_path = tmp / "final.mp4"
             mood = req.music_mood or config["music_mood"]
 
-            if mood:
+            if mood and mood != "none":
                 select_and_mix_music(
                     captioned_path,
                     final_path,
@@ -164,7 +177,7 @@ async def create_short(req) -> dict:
             final_path = tmp / "final.mp4"
             mood = req.music_mood or config["music_mood"]
 
-            if mood:
+            if mood and mood != "none":
                 select_and_mix_music(
                     captioned_path,
                     final_path,
@@ -173,21 +186,16 @@ async def create_short(req) -> dict:
             else:
                 final_path = captioned_path
 
-            # Step 9: Add sound effects after music, before thumbnail generation
-            sfx_path = tmp / "sfx.mp4"
-
-            # Use SFX from request if provided, otherwise auto-detect from emotion
-            sfx_events = (
-                [event.model_dump() for event in req.sfx_events]
-                if req.sfx_events
-                else auto_sfx_for_emotion(
-                    req.emotion_type or "excited",
-                    req.end_time - req.start_time,
-                )
-            )
-
-            add_sfx(final_path, sfx_path, sfx_events)
-            final_path = sfx_path
+        # SFX is part of every output path, including face layouts. Apply it
+        # last so it is mixed with the final caption/music audio consistently.
+        sfx_path = tmp / "sfx.mp4"
+        sfx_events = (
+            [event.model_dump() for event in req.sfx_events]
+            if req.sfx_events
+            else auto_sfx_for_emotion(req.emotion_type or "excited", req.end_time - req.start_time)
+        )
+        add_sfx(final_path, sfx_path, sfx_events)
+        final_path = sfx_path
 
 
         # Generate thumbnail
@@ -231,6 +239,16 @@ async def create_short(req) -> dict:
             "style_applied": req.style,
             "styleApplied": req.style,
         }
+
+
+def apply_caption_style(config: dict, caption_style: str) -> None:
+    """Map editor labels to the existing caption service configuration."""
+    styles = {
+        "bold": {"caption_style": "white_bold_bottom", "font_size": 64, "text_color": "white", "highlight_color": "#FFD700"},
+        "karaoke": {"caption_style": "karaoke_yellow", "font_size": 64, "text_color": "#FFFF00", "highlight_color": "#FF4444"},
+        "minimal": {"caption_style": "small_white", "font_size": 40, "text_color": "white", "highlight_color": "white"},
+    }
+    config.update(styles.get(caption_style, {}))
 
 def probe_video_duration(path: Path) -> float:
     result = subprocess.run(
@@ -347,10 +365,59 @@ def get_video_duration(path: Path) -> float:
 
 
 async def download_file(url: str, dest: Path):
+    if _is_youtube_url(url):
+        # Raw source videos are intentionally not stored in Supabase: the
+        # Free plan rejects uploads above 50 MB. Download them only for the
+        # lifetime of this render, then upload the much smaller final short.
+        await asyncio.to_thread(download_youtube_video, url, dest)
+        return
+
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, follow_redirects=True, timeout=300.0)
         resp.raise_for_status()
         dest.write_bytes(resp.content)
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "youtu.be" or host.endswith(".youtube.com") or host == "youtube.com"
+
+
+def download_youtube_video(url: str, dest: Path):
+    args = [
+        "yt-dlp",
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        "--format",
+        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "--merge-output-format",
+        "mp4",
+        "--output",
+        str(dest),
+    ]
+
+    cookie_path = None
+    encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
+    if encoded_cookies:
+        try:
+            cookie_path = dest.parent / "youtube-cookies.txt"
+            cookie_path.write_bytes(base64.b64decode(encoded_cookies, validate=True))
+            args.extend(["--cookies", str(cookie_path)])
+        except ValueError as exc:
+            raise RuntimeError("invalid YOUTUBE_COOKIES_BASE64") from exc
+
+    try:
+        result = subprocess.run(args + [url], capture_output=True, text=True)
+    finally:
+        if cookie_path:
+            cookie_path.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "unknown yt-dlp error"
+        raise RuntimeError(f"yt-dlp download failed: {message}")
+    if not dest.is_file():
+        raise RuntimeError(f"yt-dlp did not create expected source file: {dest}")
 
 
 async def upload_to_supabase(

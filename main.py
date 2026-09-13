@@ -29,6 +29,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("shortsyou-edit")
 
+# FFmpeg and the media helpers are synchronous, CPU-heavy operations. Keep one
+# render active at a time, but run it away from Uvicorn's event loop so new
+# create-short requests can still be accepted immediately.
+render_slots = asyncio.Semaphore(1)
+
 
 # ---------------------------------------------------------
 # App
@@ -78,6 +83,9 @@ class CreateShortRequest(BaseModel):
     callback_key: str
 
     layout: str = "standard"
+    background_style: Optional[str] = None
+    color_grade: Optional[str] = None
+    caption_style: Optional[str] = None
 
     emotion_type:    str   = "excited"
     sfx_events:      list[SFXEvent] = []
@@ -145,7 +153,10 @@ async def process_in_background(req: CreateShortRequest):
             req.clip_id,
         )
 
-        result = await create_short(req)
+        async with render_slots:
+            result = await asyncio.to_thread(
+                lambda: asyncio.run(create_short(req))
+            )
 
         logger.info(
             "Render completed | job_id=%s clip_id=%s",
