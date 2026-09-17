@@ -1,10 +1,13 @@
 import asyncio
 import json
 import logging
+import os
+import tempfile
+from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -12,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 
 
 from services.renderer import create_short
+from services.audio import extract_youtube_audio
+from services.renderer import upload_to_supabase
 # from services.preview import create_preview
 
 
@@ -57,6 +62,20 @@ class SFXEvent(BaseModel):
     type:      str
     at_second: float
 
+class CaptionWord(BaseModel):
+    word: str
+    start: float
+    end: float
+
+class ExtractAudioRequest(BaseModel):
+    video_url: str
+    user_id: str
+    video_id: str
+
+class ExtractAudioResponse(BaseModel):
+    audio_url: str
+    bytes: int
+
 # ---------------------------------------------------------
 # Request / Response Models
 # ---------------------------------------------------------
@@ -74,6 +93,9 @@ class CreateShortRequest(BaseModel):
     style: str = "clean"
 
     hook_text: Optional[str] = None
+    # These timestamps must be supplied by ShortsYou_Server's transcript.
+    # Never infer them locally: rendering has no ASR fallback.
+    caption_words: list[CaptionWord] = []
     music_mood: Optional[str] = None
 
     remove_silences: bool = True
@@ -121,13 +143,15 @@ async def health():
 async def create_short_endpoint(req: CreateShortRequest):
 
     logger.info(
-        "Received render job | job_id=%s clip_id=%s style=%s",
+        "Received render job | job_id=%s clip_id=%s style=%s caption_source=%s caption_words=%d",
         req.job_id,
         req.clip_id,
         req.style,
+        "transcription_service" if req.caption_words else "none",
+        len(req.caption_words),
     )
 
-    # Don't block the HTTP request while FFmpeg/Whisper runs.
+    # Don't block the HTTP request while FFmpeg runs.
     asyncio.create_task(
         process_in_background(req)
     )
@@ -137,6 +161,32 @@ async def create_short_endpoint(req: CreateShortRequest):
         accepted=True,
         eta_seconds=120,
     )
+
+
+@app.post("/extract-audio", response_model=ExtractAudioResponse)
+async def extract_audio_endpoint(
+    req: ExtractAudioRequest,
+    internal_key: str | None = Header(default=None, alias="X-Internal-API-Key"),
+):
+    """Fetch and publish audio from the media worker for the ASR service."""
+    expected_key = os.getenv("INTERNAL_API_KEY", "")
+    if expected_key and internal_key != expected_key:
+        raise HTTPException(status_code=401, detail="invalid internal service key")
+    logger.info("Extracting transcription audio | video_id=%s", req.video_id)
+    with tempfile.TemporaryDirectory(prefix="shortsyou-audio-") as directory:
+        audio_path = Path(directory) / "audio.m4a"
+        await extract_youtube_audio(req.video_url, audio_path)
+        size = audio_path.stat().st_size
+        if size > 45 << 20:
+            raise ValueError("audio track exceeds the 45 MB transcription upload limit")
+        audio_url = await upload_to_supabase(
+            audio_path,
+            "videos",
+            f"transcription-audio/{req.user_id}/{req.video_id}.m4a",
+            "audio/mp4",
+        )
+    logger.info("Transcription audio ready | video_id=%s bytes=%d", req.video_id, size)
+    return ExtractAudioResponse(audio_url=audio_url, bytes=size)
 
 
 # ---------------------------------------------------------

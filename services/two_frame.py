@@ -67,8 +67,11 @@ def create_adaptive_face_short(
             if not ok:
                 break
             if frame_index % scan_every == 0:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                found = cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(max(36, frame_w // 24), max(36, frame_h // 24)))
+                gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                found = cascade.detectMultiScale(
+                    gray, scaleFactor=1.08, minNeighbors=4,
+                    minSize=(max(28, frame_w // 32), max(28, frame_h // 32)),
+                )
                 candidates = sorted((tuple(map(int, face)) for face in found), key=lambda f: f[2] * f[3], reverse=True)[:3]
                 if candidates:
                     # Sorting left-to-right makes panel placement stable when faces are similar sizes.

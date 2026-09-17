@@ -37,7 +37,7 @@ def _apply_blur_background(input_path: Path, output_path: Path):
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", "22",
-        "-preset", "medium",
+        "-preset", "veryfast",
 
         "-c:a", "aac",
         "-b:a", "128k",
@@ -67,7 +67,7 @@ def _apply_dark_gradient(input_path: Path, output_path: Path):
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", "22",
-        "-preset", "medium",
+        "-preset", "veryfast",
 
         "-c:a", "aac",
         "-b:a", "128k",
@@ -105,7 +105,7 @@ def _apply_solid_color(
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", "22",
-        "-preset", "medium",
+        "-preset", "veryfast",
 
         "-c:a", "aac",
         "-b:a", "128k",

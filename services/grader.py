@@ -32,7 +32,7 @@ def apply_color_grade(input_path: Path, output_path: Path, grade: str):
         "-vf", f"lut3d='{lut_path}'",
         "-c:v", "libx264",
         "-crf", "22",
-        "-preset", "medium",
+        "-preset", "veryfast",
         "-c:a", "copy",
         str(output_path)
     ], check=True, capture_output=True)

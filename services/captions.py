@@ -30,32 +30,6 @@ def _has_drawtext() -> bool:
     return "drawtext" in result.stdout
 
 
-def _transcribe_local(video_path: Path) -> list[dict]:
-    try:
-        import whisper
-    except ImportError:
-        return []
-
-    model = whisper.load_model("base")
-    result = model.transcribe(
-        str(video_path),
-        word_timestamps=True,
-        verbose=False,
-    )
-
-    words = []
-    for segment in result.get("segments", []):
-        for word_data in segment.get("words", []):
-            word = word_data.get("word", "").strip()
-            if word:
-                words.append({
-                    "word":  word,
-                    "start": word_data["start"],
-                    "end":   word_data["end"],
-                })
-    return words
-
-
 def _group_words(words: list[dict], group_size: int = WORDS_PER_GROUP) -> list[dict]:
     """
     Groups individual word timestamps into caption phrases.
@@ -91,26 +65,32 @@ def add_captions(
     output_path: Path,
     config: dict,
     hook_text: str = None,
+    caption_words: list[dict] | None = None,
 ) -> None:
     """
-    Burns animated captions into the video using FFmpeg drawtext.
-    Shows WORDS_PER_GROUP words at a time — readable on mobile.
-    Falls back to silent copy if drawtext is unavailable.
+    Burns caption words supplied by the transcription service. This service
+    deliberately never performs ASR/Whisper: exporting must remain fast and
+    use the authoritative timing already saved by the API.
     """
-    if not _has_drawtext():
-        print("[captions] ffmpeg drawtext filter is unavailable; skipping caption burn-in and copying input video")
-        import shutil
-        shutil.copy2(input_path, output_path)
-        return
-
     font      = _detect_font()
     font_size = config.get("font_size", 60)
     color     = config.get("text_color", "white")
     highlight = config.get("highlight_color", "#FFD700")
 
-    # Transcribe locally with Whisper
-    words  = _transcribe_local(input_path)
+    words = caption_words or []
+    if caption_words:
+        print(f"[captions] source=transcription_service words={len(caption_words)}")
+    else:
+        print("[captions] source=none; rendering without spoken captions")
     groups = _group_words(words, WORDS_PER_GROUP)
+
+    # Some local FFmpeg builds (including the installed one on this machine)
+    # omit libfreetype and therefore drawtext. Do not silently ship an
+    # uncaptioned short: OpenCV provides a portable fallback.
+    if not _has_drawtext():
+        print("[captions] ffmpeg drawtext unavailable; using OpenCV caption renderer")
+        _burn_captions_with_opencv(input_path, output_path, groups, hook_text, color, highlight)
+        return
 
     filters = []
 
@@ -164,7 +144,7 @@ def add_captions(
         "-vf", filter_str,
         "-c:v", "libx264",
         "-crf", "22",
-        "-preset", "medium",
+        "-preset", "veryfast",
         "-c:a", "copy",
         str(output_path),
     ]
@@ -180,3 +160,81 @@ def add_captions(
     if not output_path.exists() or output_path.stat().st_size == 0:
         import shutil
         shutil.copy2(input_path, output_path)
+
+
+def _burn_captions_with_opencv(
+    input_path: Path,
+    output_path: Path,
+    groups: list[dict],
+    hook_text: str | None,
+    color: str,
+    highlight: str,
+) -> None:
+    """Portable caption path for FFmpeg installations without drawtext."""
+    try:
+        import cv2
+    except ImportError:
+        import shutil
+        print("[captions] OpenCV unavailable; copying uncaptioned video")
+        shutil.copy2(input_path, output_path)
+        return
+
+    def parse_color(value: str) -> tuple[int, int, int]:
+        value = value.lstrip("#")
+        try:
+            return tuple(int(value[i:i + 2], 16) for i in (4, 2, 0))
+        except ValueError:
+            return (255, 255, 255)
+
+    def draw_text(frame, text: str, y: int, text_color: tuple[int, int, int]):
+        lines = [text[i:i + 27] for i in range(0, len(text), 27)] or [text]
+        font, scale, thickness = cv2.FONT_HERSHEY_DUPLEX, 1.25, 3
+        line_height = 50
+        top = y - 42
+        bottom = y + line_height * len(lines) + 12
+        cv2.rectangle(frame, (32, top), (frame.shape[1] - 32, bottom), (0, 0, 0), -1)
+        for index, line in enumerate(lines):
+            (width, _), _ = cv2.getTextSize(line, font, scale, thickness)
+            x = max(20, (frame.shape[1] - width) // 2)
+            cv2.putText(frame, line, (x, y + index * line_height), font, scale, text_color, thickness, cv2.LINE_AA)
+
+    cap = cv2.VideoCapture(str(input_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not cap.isOpened() or width <= 0 or height <= 0:
+        cap.release()
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        silent_path = Path(temp_dir) / "captioned-silent.mp4"
+        writer = cv2.VideoWriter(str(silent_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            import shutil
+            shutil.copy2(input_path, output_path)
+            return
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if hook_text and timestamp <= 3:
+                draw_text(frame, hook_text, 120, parse_color(highlight))
+            for group in groups:
+                if group["start"] <= timestamp <= group["end"]:
+                    draw_text(frame, group["text"], height - 180, parse_color(color))
+                    break
+            writer.write(frame)
+        writer.release()
+        cap.release()
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", str(silent_path), "-i", str(input_path),
+            "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest", str(output_path),
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[captions] OpenCV caption mux failed:\n{result.stderr}")
+            import shutil
+            shutil.copy2(input_path, output_path)

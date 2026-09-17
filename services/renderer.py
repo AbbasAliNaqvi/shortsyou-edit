@@ -70,17 +70,25 @@ async def create_short(req) -> dict:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
 
-        # Step 1: Download video from Supabase signed URL
+        # Step 1: fetch only the requested part of a YouTube source. Downloading
+        # a whole long video just to render a 30-second short dominates latency.
         raw_path = tmp / "raw.mp4"
-        await download_file(req.video_url, raw_path)
+        source_was_clipped = await download_file(
+            req.video_url, raw_path, req.start_time, req.end_time
+        )
 
         # Step 2: Extract the clip segment
         clip_path = tmp / "clip.mp4"
-        extract_clip(raw_path, clip_path, req.start_time, req.end_time)
+        if source_was_clipped:
+            extract_clip(raw_path, clip_path, 0, req.end_time - req.start_time)
+        else:
+            extract_clip(raw_path, clip_path, req.start_time, req.end_time)
 
-        # Step 3: Remove silences and fillers if requested
+        # Step 3: Silence removal is intentionally separate from captions. The
+        # API currently supplies no time-remapping plan after cuts, so filler
+        # removal is not claimed or silently approximated here.
         clean_path = tmp / "clean.mp4"
-        if req.remove_silences or req.remove_fillers:
+        if req.remove_silences:
             remove_silences_and_fillers(clip_path, clean_path)
         else:
             clean_path = clip_path
@@ -128,6 +136,7 @@ async def create_short(req) -> dict:
                 captioned_path,
                 config,
                 req.hook_text,
+                [word.model_dump() for word in req.caption_words],
             )
 
             # Select and mix background music
@@ -171,6 +180,7 @@ async def create_short(req) -> dict:
                 captioned_path,
                 config,
                 req.hook_text,
+                [word.model_dump() for word in req.caption_words],
             )
 
             # Step 8: Select and mix background music
@@ -330,6 +340,8 @@ def extract_clip(input_path: Path, output_path: Path, start: float, end: float):
             str(clip_duration),
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -364,18 +376,19 @@ def get_video_duration(path: Path) -> float:
     return float(data["format"]["duration"])
 
 
-async def download_file(url: str, dest: Path):
+async def download_file(url: str, dest: Path, start: float = 0, end: float | None = None) -> bool:
     if _is_youtube_url(url):
         # Raw source videos are intentionally not stored in Supabase: the
         # Free plan rejects uploads above 50 MB. Download them only for the
         # lifetime of this render, then upload the much smaller final short.
-        await asyncio.to_thread(download_youtube_video, url, dest)
-        return
+        await asyncio.to_thread(download_youtube_video, url, dest, start, end)
+        return True
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, follow_redirects=True, timeout=300.0)
         resp.raise_for_status()
         dest.write_bytes(resp.content)
+    return False
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -383,19 +396,21 @@ def _is_youtube_url(url: str) -> bool:
     return host == "youtu.be" or host.endswith(".youtube.com") or host == "youtube.com"
 
 
-def download_youtube_video(url: str, dest: Path):
+def download_youtube_video(url: str, dest: Path, start: float = 0, end: float | None = None):
     args = [
         "yt-dlp",
         "--no-playlist",
         "--quiet",
         "--no-warnings",
         "--format",
-        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b",
         "--merge-output-format",
         "mp4",
         "--output",
         str(dest),
     ]
+    if end is not None and end > start:
+        args.extend(["--download-sections", f"*{max(0, start):.3f}-{end:.3f}"])
 
     cookie_path = None
     encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()

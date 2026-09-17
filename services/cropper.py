@@ -60,7 +60,7 @@ def crop_to_vertical(
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        "veryfast",
         "-crf",
         "20",
         "-profile:v",
