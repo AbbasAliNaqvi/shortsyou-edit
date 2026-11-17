@@ -12,10 +12,11 @@ def remove_silences_and_fillers(input_path: Path, output_path: Path):
     # Detect silence
     result = subprocess.run([
         "ffmpeg",
+        "-nostdin",
         "-i", str(input_path),
         "-af", "silencedetect=noise=-30dB:d=0.5",
         "-f", "null", "-"
-    ], capture_output=True, text=True)
+    ], capture_output=True, text=True, timeout=60)
 
     stderr = result.stderr
     silence_periods = parse_silence(stderr)
@@ -49,7 +50,7 @@ def remove_silences_and_fillers(input_path: Path, output_path: Path):
     filter_complex += f";{concat_a}concat=n={n}:v=0:a=1[aout]"
 
     subprocess.run([
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", "-nostdin",
         "-i", str(input_path),
         "-filter_complex", filter_complex,
         "-map", "[vout]",
@@ -58,7 +59,7 @@ def remove_silences_and_fillers(input_path: Path, output_path: Path):
         "-crf", "22",
         "-c:a", "aac",
         str(output_path)
-    ], check=True, capture_output=True)
+    ], check=True, capture_output=True, timeout=180)
 
 
 def parse_silence(stderr: str) -> list[tuple[float, float]]:

@@ -2,6 +2,62 @@ import json
 import subprocess
 from pathlib import Path
 
+import cv2
+import numpy as np
+
+
+def _speaker_anchor(video_path: Path, width: int, height: int) -> tuple[int, int]:
+    """Return a stable face-biased crop anchor, falling back to frame centre.
+
+    Sampling avoids an expensive frame-by-frame detector while preventing a
+    centered crop from cutting off a speaker positioned at either edge.
+    """
+    fallback = (width // 2, height // 2)
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+    eye_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
+    if detector.empty() or eye_detector.empty():
+        return fallback
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return fallback
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    # Ten lightweight samples are enough for a stable anchor and are much
+    # faster than scanning every frame.  A strict neighbour threshold is
+    # crucial: loose Haar detections can mistake textures for faces.
+    sample_count = min(10, max(6, frame_count // 90))
+    anchors = []
+    try:
+        for frame_index in np.linspace(0, max(0, frame_count - 1), sample_count, dtype=int):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=8, minSize=(max(36, width // 18), max(36, height // 18)))
+            verified = []
+            for x, y, w, h in faces:
+                # A face-shaped texture is not enough. Require at least one
+                # eye-like feature within it; this prevents foliage, posters,
+                # and high-contrast backgrounds from hijacking the crop.
+                eyes = eye_detector.detectMultiScale(
+                    gray[y:y + h, x:x + w],
+                    scaleFactor=1.1,
+                    minNeighbors=4,
+                    minSize=(max(8, w // 7), max(8, h // 7)),
+                )
+                if len(eyes):
+                    verified.append((x, y, w, h))
+            if verified:
+                x, y, w, h = max(verified, key=lambda face: face[2] * face[3])
+                anchors.append((x + w // 2, y + h // 2))
+    finally:
+        capture.release()
+    if len(anchors) < 2:
+        return fallback
+    # Median rejects a transient listener/cutaway face and keeps the crop calm.
+    return int(np.median([a[0] for a in anchors])), int(np.median([a[1] for a in anchors]))
+
 
 def crop_to_vertical(
     input_path: Path,
@@ -25,7 +81,8 @@ def crop_to_vertical(
         crop_w = int(round(height * target_ratio))
         crop_w -= crop_w % 2
         crop_h -= crop_h % 2
-        x_offset = (width - crop_w) // 2
+        face_x, _ = _speaker_anchor(input_path, width, height)
+        x_offset = face_x - crop_w // 2
         y_offset = 0
     else:
         crop_w = width
@@ -33,18 +90,22 @@ def crop_to_vertical(
         crop_w -= crop_w % 2
         crop_h -= crop_h % 2
         x_offset = 0
-        y_offset = (height - crop_h) // 2
+        _, face_y = _speaker_anchor(input_path, width, height)
+        # Keep a little headroom over the speaker rather than centering their
+        # face exactly in the frame.
+        y_offset = face_y - int(crop_h * .35)
 
     crop_w = max(2, min(crop_w, width))
     crop_h = max(2, min(crop_h, height))
-    x_offset = max(0, (width - crop_w) // 2)
-    y_offset = max(0, (height - crop_h) // 2)
+    x_offset = max(0, min(x_offset, width - crop_w))
+    y_offset = max(0, min(y_offset, height - crop_h))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     command = [
         "ffmpeg",
         "-y",
+        "-nostdin",
         "-i",
         str(input_path),
         "-map",
@@ -60,9 +121,9 @@ def crop_to_vertical(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "fast",
         "-crf",
-        "20",
+        "18",
         "-profile:v",
         "high",
         "-level",
@@ -72,7 +133,7 @@ def crop_to_vertical(
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "192k",
         "-ar",
         "48000",
         "-movflags",
@@ -84,6 +145,7 @@ def crop_to_vertical(
         command,
         capture_output=True,
         text=True,
+        timeout=180,
     )
 
     if result.returncode != 0:
